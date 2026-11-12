@@ -1,0 +1,3 @@
+*.patch -text
+*.pt binary
+*.jpg binary

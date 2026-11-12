@@ -1,0 +1,34 @@
+{
+  "training": {
+    "checkpoint": 30000,
+    "n": 298,
+    "episodes": 100,
+    "mean_error_px224": 5.5715183748019115,
+    "median_error_px224": 5.7471774882665665,
+    "p90_error_px224": 8.279236088650375,
+    "within14": 1.0,
+    "within28": 1.0,
+    "center_mean_error": 20.40311252037029,
+    "scope": "training demonstrations, deterministic first/middle/last labeled frames; no held-out validation; eval preprocessing; no robot",
+    "fixed_mean_baseline_px224": 11.574029721989222,
+    "expected_coordinate_mean_error_px224": 0.9352436284021489,
+    "grid_oracle_mean_error_px224": 5.510153986107877,
+    "max_peak_error_px224": 10.94445155746544
+  },
+  "held_out": {
+    "checkpoint": 30000,
+    "n": 21,
+    "episodes": 7,
+    "mean_error_px224": 6.117019467871999,
+    "median_error_px224": 6.314919687967812,
+    "p90_error_px224": 8.785816880989483,
+    "within14": 1.0,
+    "within28": 1.0,
+    "center_mean_error": 21.38189526235622,
+    "scope": "new12 demonstrations excluded from152 training; first/middle/last labeled frames; weak labels same color rule; eval preprocessing; no robot",
+    "fixed_mean_baseline_px224": 8.377536743575524,
+    "expected_coordinate_mean_error_px224": 1.8151281734600944,
+    "grid_oracle_mean_error_px224": 6.044945075300463,
+    "max_peak_error_px224": 9.739785311958524
+  }
+}

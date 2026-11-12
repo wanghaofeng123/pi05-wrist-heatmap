@@ -1,0 +1,163 @@
+--- a/coverage_data.py
++++ b/coverage_data.py
+@@ -60,6 +60,16 @@
+             table = pq.read_table(path)
+             self.states.extend(table['observation.state'].to_pylist())
+             self.targets.extend(table['action'].to_pylist())
++        # Labels are sidecars, indexed against the immutable exported episode frames.
++        self.spatial = {}
++        spec=json.loads(Path(os.environ['XARM_DATASET_SPEC']).read_text())
++        offsets={};offset=0
++        for ep in manifest['episodes']:
++            offsets[ep['episode_index']]=offset;offset+=ep['frames']
++        for label in json.loads(Path(spec['spatial_labels_path']).read_text()):
++            if label['dataset']==str(self.root) and label['valid']:
++                u,v=label['uv']
++                self.spatial[offsets[label['episode_index']]+label['frame_index']]=np.array([(u+.5)*224/640-.5,(v+.5)*168/480-.5+28],np.float32)
+         self.states = np.asarray(self.states, dtype=np.float64)
+         self.targets = np.asarray(self.targets, dtype=np.float64)
+         # Images/state come from one frame only; future labels come from the
+@@ -78,6 +88,8 @@
+         sample['observation.state'] = encode_state(self.states[index])
+         sample['action'] = encode_actions(self.states[index], self.targets[ids])
+         sample['action_valid_mask'] = valid
++        sample['spatial_uv']=self.spatial.get(index,np.zeros(2,np.float32))
++        sample['spatial_valid']=np.bool_(index in self.spatial)
+         if self.prompt is not None:
+             sample = self.prompt(sample)
+         return sample
+--- a/openpi/training/data_loader.py
++++ b/openpi/training/data_loader.py
+@@ -57,7 +57,9 @@
+     def __getitem__(self, index: SupportsIndex) -> T_co:
+         sample = self._dataset[index]
+         valid = sample.get("action_valid_mask")
++        spatial = {k: sample[k] for k in ("spatial_uv", "spatial_valid") if k in sample}
+         result = self._transform(sample)
++        result.update(spatial)
+         if valid is not None:
+             result["action_valid_mask"] = np.asarray(valid, dtype=bool).copy()
+         return result
+@@ -579,6 +581,7 @@
+         for batch in self._data_loader:
+             if "action_valid_mask" in batch:
+                 yield {"observation": _model.Observation.from_dict(batch),
+-                       "actions": batch["actions"], "action_valid_mask": batch["action_valid_mask"]}
++                       "actions": batch["actions"], "action_valid_mask": batch["action_valid_mask"],
++                       **{k:batch[k] for k in ("spatial_uv","spatial_valid") if k in batch}}
+             else:
+                 yield _model.Observation.from_dict(batch), batch["actions"]
+--- a/rlinf/models/embodiment/openpi/__init__.py
++++ b/rlinf/models/embodiment/openpi/__init__.py
+@@ -89,6 +89,9 @@
+             all_state_dict.update(state_dict)
+         load_checked(model, all_state_dict, base_safetensors=True)
+ 
++    # Initialize auxiliary parameters only after strict loading of all base policy weights.
++    from spatial_aux import SpatialHead
++    model.spatial_head = SpatialHead()
+     model.paligemma_with_expert.to_bfloat16_for_selected_params("bfloat16")
+     # fsdp replace
+     # model.paligemma_with_expert.replace_gemma_decoder_layers()
+--- a/rlinf/models/embodiment/openpi/openpi_action_model.py
++++ b/rlinf/models/embodiment/openpi/openpi_action_model.py
+@@ -140,6 +140,7 @@
+             no_split_modules.append("ExploreNoiseNet")
+         if self.config.use_rlt:
+             no_split_modules.append("RLTSelfAttentionLayer")
++        no_split_modules.append("SpatialHead")
+         return no_split_modules
+ 
+     @property
+@@ -406,7 +407,7 @@
+                 observation, actions
+             )
+         else:
+-            loss = super().forward(observation, actions)
++            loss, spatial_prefix, _ = self._sft_forward_with_spatial_prefix(observation, actions)
+         if use_action_chunk_loss:
+             loss = loss[:, : self.config.action_chunk, : self.config.action_env_dim]
+         valid = data.get("action_valid_mask") if isinstance(data, dict) else None
+@@ -424,7 +425,9 @@
+             masked = torch.where(valid[..., None], loss, torch.zeros_like(loss))
+             vla_loss = (masked.sum(dim=(1, 2)) / (count * loss.shape[-1])).mean()
+         if not self.config.use_rlt:
+-            return vla_loss
++            from spatial_aux import spatial_loss
++            geo_loss=spatial_loss(self.spatial_head(spatial_prefix),data['spatial_uv'],data['spatial_valid'])
++            return {"loss":vla_loss+0.01*geo_loss,"vla_loss":vla_loss,"geo_loss":geo_loss}
+ 
+         rlt_param = next(self.rlt_module.parameters())
+         prefix_output = prefix_output.to(device=rlt_param.device, dtype=rlt_param.dtype)
+@@ -505,6 +508,71 @@
+         )
+         return loss, prefix_output, prefix_pad_masks
+ 
++    def _sft_forward_with_spatial_prefix(self, observation, actions):
++        images, img_masks, lang_tokens, lang_masks, state = (
++            self._preprocess_observation(observation, train=True)
++        )
++
++        noise = self.sample_noise(actions.shape, actions.device)
++        time = self.sample_time(actions.shape[0], actions.device)
++
++        time_expanded = time[:, None, None]
++        x_t = time_expanded * noise + (1 - time_expanded) * actions
++        u_t = noise - actions
++
++        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
++            images, img_masks, lang_tokens, lang_masks
++        )
++        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = (
++            self.embed_suffix(state, x_t, time)
++        )
++        backbone_dtype = self.paligemma_with_expert.paligemma.language_model.layers[
++            0
++        ].self_attn.q_proj.weight.dtype
++        if prefix_embs.dtype != backbone_dtype:
++            prefix_embs = prefix_embs.to(dtype=backbone_dtype)
++        if suffix_embs.dtype != backbone_dtype:
++            suffix_embs = suffix_embs.to(dtype=backbone_dtype)
++
++        pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
++        att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
++        att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
++        position_ids = torch.cumsum(pad_masks, dim=1) - 1
++        att_2d_masks_4d = self._prepare_attention_masks_4d(att_2d_masks)
++
++        def forward_func(
++            prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond
++        ):
++            (prefix_output, suffix_out), _ = self.paligemma_with_expert.forward(
++                attention_mask=att_2d_masks_4d,
++                position_ids=position_ids,
++                past_key_values=None,
++                inputs_embeds=[prefix_embs, suffix_embs],
++                use_cache=False,
++                adarms_cond=[None, adarms_cond],
++            )
++            return prefix_output, suffix_out
++
++        prefix_output, suffix_out = self._apply_checkpoint(
++            forward_func,
++            prefix_embs,
++            suffix_embs,
++            att_2d_masks_4d,
++            position_ids,
++            adarms_cond,
++        )
++
++        suffix_out = suffix_out[:, -self.config.action_horizon :]
++        suffix_out = suffix_out.to(dtype=torch.float32)
++
++        def action_out_proj_func(suffix_out):
++            return self.action_out_proj(suffix_out)
++
++        v_t = self._apply_checkpoint(action_out_proj_func, suffix_out)
++        loss = F.mse_loss(u_t, v_t, reduction="none")
++
++        return loss, prefix_output, prefix_pad_masks
++
+     def _build_rlt_prefix_cache(self, observation, *, train: bool):
+         images, img_masks, lang_tokens, lang_masks, state = (
+             self._preprocess_observation(observation, train=train)
